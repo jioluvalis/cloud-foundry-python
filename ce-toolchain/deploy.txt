@@ -1,0 +1,99 @@
+#!/bin/bash
+ibmcloud target -g ${CODE_ENGINE_RESOURCE_GROUP}
+
+# View build properties
+cat build.properties
+
+ibmcloud plugin install code-engine
+
+echo "Check Code Engine project availability"
+if ibmcloud ce proj get -n "${CODE_ENGINE_PROJECT}"; then
+  echo -e "Code Engine project ${CODE_ENGINE_PROJECT} found."
+else
+  echo -e "No Code Engine project with the name ${CODE_ENGINE_PROJECT} found. Creating new project..."
+  ibmcloud ce proj create -n "${CODE_ENGINE_PROJECT}"
+  echo -e "Code Engine project ${CODE_ENGINE_PROJECT} created."
+fi
+
+echo "Load Kube config"
+ibmcloud ce proj select -n "${CODE_ENGINE_PROJECT}" -k
+
+echo -e "Configuring access to private image registry"
+IMAGE_PULL_SECRET_NAME="ibmcloud-toolchain-${PIPELINE_TOOLCHAIN_ID}-${REGISTRY_URL}"
+
+if ! kubectl get secret ${IMAGE_PULL_SECRET_NAME}; then
+  echo -e "${IMAGE_PULL_SECRET_NAME} not found, creating it"
+  # for Container Registry, docker username is 'token' and email does not matter
+  kubectl create secret docker-registry ${IMAGE_PULL_SECRET_NAME} --docker-server=${REGISTRY_URL} --docker-password=${API_KEY} --docker-username=iamapikey --docker-email=a@b.com
+fi
+
+IMAGE_URL=${REGISTRY_URL}/${REGISTRY_NAMESPACE}/${IMAGE_NAME}:${BUILD_NUMBER}
+
+if ibmcloud ce app get -n ${APP_NAME} | grep Age; then
+  echo "Code Engine app with name ${APP_NAME} found, updating it"
+  ibmcloud ce app update -n ${APP_NAME} -i ${IMAGE_URL} --rs ${IMAGE_PULL_SECRET_NAME} -w=false
+else
+  echo "Code Engine app with name ${APP_NAME} not found, creating it"
+  ibmcloud ce app create -n ${APP_NAME} -i ${IMAGE_URL} --rs ${IMAGE_PULL_SECRET_NAME} -w=false
+fi
+
+# Bind services, if any
+while read;
+do
+  NAME=$(echo "$REPLY" | jq -j '.key')
+  PREFIX=$(echo "$REPLY" | jq -j '.value')
+
+  if ! ibmcloud ce app get -n ${APP_NAME} | grep "$NAME"; then
+    ibmcloud ce app bind -n ${APP_NAME} --si "$NAME" -p "$PREFIX" -w=false
+  fi
+done < <(jq -c 'to_entries | .[]' <<< "${SERVICE_BINDINGS}")
+
+echo "Checking if application is ready..."
+
+# Get kube service name from metadata name in service file
+export KUBE_SERVICE_NAME=${APP_NAME}
+
+for ITERATION in {1..100}
+do
+  sleep 3
+
+  kubectl get ksvc/${KUBE_SERVICE_NAME} --output=custom-columns=DOMAIN:.status.conditions[*].status
+  SVC_STATUS_READY=$( kubectl get ksvc/${KUBE_SERVICE_NAME} -o json | jq '.status?.conditions[]?.status?|select(. == "True")' )
+  echo SVC_STATUS_READY=$SVC_STATUS_READY
+
+  SVC_STATUS_NOT_READY=$( kubectl get ksvc/${KUBE_SERVICE_NAME} -o json | jq '.status?.conditions[]?.status?|select(. == "False")' )
+  echo SVC_STATUS_NOT_READY=$SVC_STATUS_NOT_READY
+
+  SVC_STATUS_UNKNOWN=$( kubectl get ksvc/${KUBE_SERVICE_NAME} -o json | jq '.status?.conditions[]?.status?|select(. == "Unknown")' )
+  echo SVC_STATUS_UNKNOWN=$SVC_STATUS_UNKNOWN
+
+  if [ \( -n "$SVC_STATUS_NOT_READY" \) -o \( -n "$SVC_STATUS_UNKNOWN" \) ]; then
+    echo "Application not ready, retrying"
+  elif [ -n "$SVC_STATUS_READY" ]; then
+    echo "Application is ready"
+    break
+  else
+    echo "Application status unknown, retrying"
+  fi
+done
+
+echo "Application service details:"
+kubectl describe ksvc/${KUBE_SERVICE_NAME}
+if [ \( -n "$SVC_STATUS_NOT_READY" \) -o \( -n "$SVC_STATUS_UNKNOWN" \) ]; then
+  echo "Application is not ready after waiting maximum time"
+  exit 1
+fi
+
+# Determine app url for polling from knative service
+TEMP_URL=$( kubectl get ksvc/${KUBE_SERVICE_NAME} -o json | jq '.status.url' )
+echo "Application status URL: $TEMP_URL"
+TEMP_URL=${TEMP_URL%\"} # remove end quote
+TEMP_URL=${TEMP_URL#\"} # remove beginning quote
+export APPLICATION_URL=$TEMP_URL
+if [ -z "$APPLICATION_URL" ]; then
+  echo "Deploy failed, no URL found for knative service"
+  exit 1
+fi
+echo "Application is available"
+echo "=========================================================="
+echo -e "View the application at: $APPLICATION_URL"
